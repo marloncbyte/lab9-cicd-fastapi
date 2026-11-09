@@ -1,0 +1,104 @@
+name: LAB9 - CI/CD Homologacao e Producao
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/lab9-cicd-fastapi
+  CONTAINER_NAME: lab9-api
+
+jobs:
+  build_test_image:
+    name: Build, testes e imagem Docker
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Baixar codigo
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Instalar dependencias
+        run: pip install -r requirements-dev.txt
+
+      - name: Validar estilo com flake8
+        run: flake8 app tests
+
+      - name: Executar testes
+        run: pytest -v
+
+      - name: Configurar Docker Buildx
+        if: github.event_name == 'push'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login no Docker Hub
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Construir e publicar imagem
+        if: github.event_name == 'push'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:latest
+
+  deploy_homologacao:
+    name: Deploy automatico - HOMOL
+    needs: build_test_image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    environment:
+      name: homologacao
+    steps:
+      - name: Deploy na EC2 de homologacao
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HML_EC2_HOST }}
+          username: ${{ secrets.HML_EC2_USERNAME }}
+          key: ${{ secrets.HML_EC2_SSH_KEY }}
+          script: |
+            docker pull ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            docker stop ${{ env.CONTAINER_NAME }} || true
+            docker rm ${{ env.CONTAINER_NAME }} || true
+            docker run -d --restart unless-stopped \
+              --name ${{ env.CONTAINER_NAME }} \
+              -p 8080:8000 \
+              ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+  deploy_producao:
+    name: Deploy controlado - PRD
+    needs: build_test_image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: producao
+    steps:
+      - name: Deploy na EC2 de producao
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            docker pull ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            docker stop ${{ env.CONTAINER_NAME }} || true
+            docker rm ${{ env.CONTAINER_NAME }} || true
+            docker run -d --restart unless-stopped \
+              --name ${{ env.CONTAINER_NAME }} \
+              -p 8080:8000 \
+              ${{ env.IMAGE_NAME }}:${{ github.sha }}
